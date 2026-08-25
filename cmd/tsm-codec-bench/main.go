@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"math"
 	"os"
@@ -29,7 +30,7 @@ const (
 	codecBOS codec = iota + 1
 	codecSubcolumn
 	codecGorilla
-	codecDeltaSimple8bBitcast
+	codecIntegerDeltaAdaptiveBitcast
 )
 
 func (c codec) name() string {
@@ -40,8 +41,8 @@ func (c codec) name() string {
 		return "SUBCOLUMN"
 	case codecGorilla:
 		return "GORILLA"
-	case codecDeltaSimple8bBitcast:
-		return "DELTA_SIMPLE8B_BITCAST"
+	case codecIntegerDeltaAdaptiveBitcast:
+		return "INTEGER_DELTA_ADAPTIVE_BITCAST"
 	default:
 		return "UNKNOWN"
 	}
@@ -90,9 +91,11 @@ func main() {
 	}
 
 	fmt.Println("system,dataset,codec,iteration,rows,columns,write_ms,read_ms,file_bytes,hash_ok")
-	codecs := []codec{codecBOS, codecSubcolumn, codecGorilla, codecDeltaSimple8bBitcast}
-	for _, selected := range codecs {
-		for iteration := -warmups; iteration < iterations; iteration++ {
+	codecs := []codec{codecBOS, codecSubcolumn, codecGorilla, codecIntegerDeltaAdaptiveBitcast}
+	for iteration := -warmups; iteration < iterations; iteration++ {
+		start := (iteration + warmups) % len(codecs)
+		for step := range codecs {
+			selected := codecs[(start+step)%len(codecs)]
 			runtime.GC()
 			path := filepath.Join(os.Args[2], fmt.Sprintf("%s_%s_%d.tsm", sanitize(os.Args[3]), strings.ToLower(selected.name()), iteration))
 			measurement, runErr := runOnce(path, data, selected)
@@ -186,7 +189,7 @@ func encodeBlock(values []float64, offset int, selected codec) ([]byte, error) {
 		array := &tsdb.FloatArray{Timestamps: timestamps, Values: valueCopy}
 		return tsm1.EncodeFloatArrayBlockWithEncoding(array, nil, encoding)
 	}
-	if selected == codecDeltaSimple8bBitcast {
+	if selected == codecIntegerDeltaAdaptiveBitcast {
 		bitValues := make([]int64, len(values))
 		for i, value := range values {
 			bitValues[i] = int64(math.Float64bits(value))
@@ -202,9 +205,12 @@ func decodeAndValidate(reader *tsm1.TSMReader, expected dataset, selected codec)
 	columnIndex := 0
 	iterator := reader.BlockIterator()
 	for iterator.Next() {
-		key, minTime, maxTime, blockType, _, block, err := iterator.Read()
+		key, minTime, maxTime, blockType, checksum, block, err := iterator.Read()
 		if err != nil {
 			return false, err
+		}
+		if crc32.ChecksumIEEE(block) != checksum {
+			return false, fmt.Errorf("TSM block checksum mismatch for key %q", key)
 		}
 		for columnIndex < len(expected.columns) && !bytesEqual(key, benchmarkKey(columnIndex)) {
 			columnIndex++
@@ -217,7 +223,7 @@ func decodeAndValidate(reader *tsm1.TSMReader, expected dataset, selected codec)
 		if minTime != int64(row) {
 			return false, nil
 		}
-		if selected == codecDeltaSimple8bBitcast {
+		if selected == codecIntegerDeltaAdaptiveBitcast {
 			if blockType != tsm1.BlockInteger {
 				return false, nil
 			}
