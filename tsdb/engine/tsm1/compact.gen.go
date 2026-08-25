@@ -128,14 +128,14 @@ func (k *tsmBatchKeyIterator) combineFloat(dedup bool) blocks {
 			continue
 		}
 
-		if count < k.size {
+		if count < k.size || !k.blockUsesConfiguredEncoding(k.blocks[i].b) {
 			break
 		}
 
 		k.merged = append(k.merged, k.blocks[i])
 	}
 
-	if k.fast {
+	if k.fast && k.blocksUseConfiguredEncoding(k.blocks[i:]) {
 		for i < len(k.blocks) {
 			// skip this block if it's values were already read
 			if k.blocks[i].read() {
@@ -149,7 +149,7 @@ func (k *tsmBatchKeyIterator) combineFloat(dedup bool) blocks {
 	}
 
 	// if we only have 1 blocks left, just append it as is and avoid decoding/recoding
-	if i == len(k.blocks)-1 {
+	if i == len(k.blocks)-1 && k.blockUsesConfiguredEncoding(k.blocks[i].b) {
 		if !k.blocks[i].read() {
 			k.merged = append(k.merged, k.blocks[i])
 		}
@@ -198,7 +198,7 @@ func (k *tsmBatchKeyIterator) chunkFloat(dst blocks) blocks {
 		minTime, maxTime := values.Timestamps[0], values.Timestamps[len(values.Timestamps)-1]
 		values.Values = k.mergedFloatValues.Values[:k.size]
 
-		cb, err := EncodeFloatArrayBlock(&values, nil) // TODO(edd): pool this buffer
+		cb, err := k.encodeFloatArrayBlock(&values, nil) // TODO(edd): pool this buffer
 		if err != nil {
 			k.handleEncodeError(err, "float")
 			return nil
@@ -218,7 +218,7 @@ func (k *tsmBatchKeyIterator) chunkFloat(dst blocks) blocks {
 	// Re-encode the remaining values into the last block
 	if k.mergedFloatValues.Len() > 0 {
 		minTime, maxTime := k.mergedFloatValues.Timestamps[0], k.mergedFloatValues.Timestamps[len(k.mergedFloatValues.Timestamps)-1]
-		cb, err := EncodeFloatArrayBlock(k.mergedFloatValues, nil) // TODO(edd): pool this buffer
+		cb, err := k.encodeFloatArrayBlock(k.mergedFloatValues, nil) // TODO(edd): pool this buffer
 		if err != nil {
 			k.handleEncodeError(err, "float")
 			return nil
@@ -352,14 +352,14 @@ func (k *tsmBatchKeyIterator) combineInteger(dedup bool) blocks {
 			continue
 		}
 
-		if count < k.size {
+		if count < k.size || !k.blockUsesConfiguredEncoding(k.blocks[i].b) {
 			break
 		}
 
 		k.merged = append(k.merged, k.blocks[i])
 	}
 
-	if k.fast {
+	if k.fast && k.blocksUseConfiguredEncoding(k.blocks[i:]) {
 		for i < len(k.blocks) {
 			// skip this block if it's values were already read
 			if k.blocks[i].read() {
@@ -373,7 +373,7 @@ func (k *tsmBatchKeyIterator) combineInteger(dedup bool) blocks {
 	}
 
 	// if we only have 1 blocks left, just append it as is and avoid decoding/recoding
-	if i == len(k.blocks)-1 {
+	if i == len(k.blocks)-1 && k.blockUsesConfiguredEncoding(k.blocks[i].b) {
 		if !k.blocks[i].read() {
 			k.merged = append(k.merged, k.blocks[i])
 		}
@@ -576,14 +576,14 @@ func (k *tsmBatchKeyIterator) combineUnsigned(dedup bool) blocks {
 			continue
 		}
 
-		if count < k.size {
+		if count < k.size || !k.blockUsesConfiguredEncoding(k.blocks[i].b) {
 			break
 		}
 
 		k.merged = append(k.merged, k.blocks[i])
 	}
 
-	if k.fast {
+	if k.fast && k.blocksUseConfiguredEncoding(k.blocks[i:]) {
 		for i < len(k.blocks) {
 			// skip this block if it's values were already read
 			if k.blocks[i].read() {
@@ -597,7 +597,7 @@ func (k *tsmBatchKeyIterator) combineUnsigned(dedup bool) blocks {
 	}
 
 	// if we only have 1 blocks left, just append it as is and avoid decoding/recoding
-	if i == len(k.blocks)-1 {
+	if i == len(k.blocks)-1 && k.blockUsesConfiguredEncoding(k.blocks[i].b) {
 		if !k.blocks[i].read() {
 			k.merged = append(k.merged, k.blocks[i])
 		}
@@ -800,14 +800,14 @@ func (k *tsmBatchKeyIterator) combineString(dedup bool) blocks {
 			continue
 		}
 
-		if count < k.size {
+		if count < k.size || !k.blockUsesConfiguredEncoding(k.blocks[i].b) {
 			break
 		}
 
 		k.merged = append(k.merged, k.blocks[i])
 	}
 
-	if k.fast {
+	if k.fast && k.blocksUseConfiguredEncoding(k.blocks[i:]) {
 		for i < len(k.blocks) {
 			// skip this block if it's values were already read
 			if k.blocks[i].read() {
@@ -821,7 +821,7 @@ func (k *tsmBatchKeyIterator) combineString(dedup bool) blocks {
 	}
 
 	// if we only have 1 blocks left, just append it as is and avoid decoding/recoding
-	if i == len(k.blocks)-1 {
+	if i == len(k.blocks)-1 && k.blockUsesConfiguredEncoding(k.blocks[i].b) {
 		if !k.blocks[i].read() {
 			k.merged = append(k.merged, k.blocks[i])
 		}
@@ -1024,14 +1024,14 @@ func (k *tsmBatchKeyIterator) combineBoolean(dedup bool) blocks {
 			continue
 		}
 
-		if count < k.size {
+		if count < k.size || !k.blockUsesConfiguredEncoding(k.blocks[i].b) {
 			break
 		}
 
 		k.merged = append(k.merged, k.blocks[i])
 	}
 
-	if k.fast {
+	if k.fast && k.blocksUseConfiguredEncoding(k.blocks[i:]) {
 		for i < len(k.blocks) {
 			// skip this block if it's values were already read
 			if k.blocks[i].read() {
@@ -1045,7 +1045,7 @@ func (k *tsmBatchKeyIterator) combineBoolean(dedup bool) blocks {
 	}
 
 	// if we only have 1 blocks left, just append it as is and avoid decoding/recoding
-	if i == len(k.blocks)-1 {
+	if i == len(k.blocks)-1 && k.blockUsesConfiguredEncoding(k.blocks[i].b) {
 		if !k.blocks[i].read() {
 			k.merged = append(k.merged, k.blocks[i])
 		}

@@ -3,12 +3,17 @@ package tsdb
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/influxdata/influxdb/v2/toml"
 )
 
 const (
+	// DefaultTSMFloatEncoding preserves the upstream Gorilla float codec unless
+	// an operator explicitly selects an experimental codec.
+	DefaultTSMFloatEncoding = "gorilla"
+
 	// DefaultEngine is the default engine for new shards
 	DefaultEngine = "tsm1"
 
@@ -133,6 +138,11 @@ type Config struct {
 	CompactThroughputBurst         toml.Size     `toml:"compact-throughput-burst"`
 	AggressivePointsPerBlock       toml.Size     `toml:"aggressive-points-per-block"`
 
+	// TSMFloatEncoding selects the value codec used for newly encoded float
+	// blocks during cache snapshots and TSM compactions. Existing blocks retain
+	// their own self-describing encoding header and remain readable.
+	TSMFloatEncoding string `toml:"tsm-float-encoding"`
+
 	// Limits
 
 	// MaxConcurrentCompactions is the maximum number of concurrent level and full compactions
@@ -188,6 +198,7 @@ func NewConfig() Config {
 		CompactThroughput:              toml.Size(DefaultCompactThroughput),
 		CompactThroughputBurst:         toml.Size(DefaultCompactThroughputBurst),
 		AggressivePointsPerBlock:       toml.Size(DefaultAggressiveMaxPointsPerBlock),
+		TSMFloatEncoding:               DefaultTSMFloatEncoding,
 
 		MaxConcurrentCompactions: DefaultMaxConcurrentCompactions,
 
@@ -221,6 +232,12 @@ func (c *Config) Validate() error {
 
 	if c.SeriesFileMaxConcurrentSnapshotCompactions < 0 {
 		return errors.New("series-file-max-concurrent-compactions must be non-negative")
+	}
+
+	switch strings.ToLower(c.TSMFloatEncoding) {
+	case "gorilla", "bos", "subcolumn":
+	default:
+		return fmt.Errorf("unrecognized tsm-float-encoding %q (valid values: gorilla, bos, subcolumn)", c.TSMFloatEncoding)
 	}
 
 	valid := false

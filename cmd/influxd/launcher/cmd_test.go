@@ -1,12 +1,22 @@
 package launcher
 
 import (
+	"context"
 	"strings"
 	"testing"
 
 	"github.com/spf13/viper"
 	"github.com/stretchr/testify/require"
 )
+
+func TestTSMFloatEncodingFlagDefault(t *testing.T) {
+	v := viper.New()
+	cmd, err := NewInfluxdCommand(context.Background(), v)
+	require.NoError(t, err)
+	flag := cmd.Flags().Lookup("storage-tsm-float-encoding")
+	require.NotNil(t, flag)
+	require.Equal(t, "gorilla", flag.DefValue)
+}
 
 func TestInvalidFlags(t *testing.T) {
 	t.Parallel()

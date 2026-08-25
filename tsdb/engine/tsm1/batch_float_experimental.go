@@ -7,6 +7,7 @@ import (
 	"math/bits"
 	"slices"
 	"sort"
+	"strings"
 )
 
 const (
@@ -24,6 +25,21 @@ const (
 	FloatArrayEncodingBOS       FloatArrayEncoding = floatCompressedBOS
 	FloatArrayEncodingSubcolumn FloatArrayEncoding = floatCompressedSubcolumn
 )
+
+// ParseFloatArrayEncoding parses the storage configuration spelling for a
+// TSM float value codec.
+func ParseFloatArrayEncoding(name string) (FloatArrayEncoding, error) {
+	switch strings.ToLower(name) {
+	case "gorilla":
+		return FloatArrayEncodingGorilla, nil
+	case "bos":
+		return FloatArrayEncodingBOS, nil
+	case "subcolumn":
+		return FloatArrayEncodingSubcolumn, nil
+	default:
+		return 0, fmt.Errorf("unknown TSM float encoding %q", name)
+	}
+}
 
 // FloatArrayEncodeAllWithEncoding encodes a TSM float value block with the
 // selected value encoding. FloatArrayEncodeAll continues to select Gorilla so

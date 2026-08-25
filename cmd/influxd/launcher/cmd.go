@@ -568,6 +568,12 @@ func (o *InfluxdOpts) BindCliOpts() []cli.Opt {
 			Desc:  "The length of time at which the engine will snapshot the cache and write it to a new TSM file if the shard hasn't received writes or deletes.",
 		},
 		{
+			DestP:   &o.StorageConfig.Data.TSMFloatEncoding,
+			Flag:    "storage-tsm-float-encoding",
+			Default: o.StorageConfig.Data.TSMFloatEncoding,
+			Desc:    "The value encoding for newly written TSM float blocks: gorilla, bos, or subcolumn.",
+		},
+		{
 			DestP: &o.StorageConfig.Data.CompactFullWriteColdDuration,
 			Flag:  "storage-compact-full-write-cold-duration",
 			Desc:  "The duration at which the engine will compact all TSM files in a shard if it hasn't received a write or delete.",

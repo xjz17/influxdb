@@ -127,6 +127,7 @@ type Engine struct {
 	logger       *zap.Logger // Logger to be used for important messages
 	traceLogger  *zap.Logger // Logger to be used when trace-logging is on.
 	traceLogging bool
+	configErr    error
 
 	fieldset *tsdb.MeasurementFieldSet
 
@@ -207,6 +208,10 @@ func NewEngine(id uint64, idx tsdb.Index, path string, walPath string, sfile *ts
 	c.Dir = path
 	c.FileStore = fs
 	c.RateLimit = opt.CompactionThroughputLimiter
+	encoding, configErr := ParseFloatArrayEncoding(opt.Config.TSMFloatEncoding)
+	if configErr == nil {
+		c.FloatEncoding = encoding
+	}
 
 	var planner CompactionPlanner = NewDefaultPlanner(fs, time.Duration(opt.Config.CompactFullWriteColdDuration))
 	planner.SetAggressiveCompactionPointsPerBlock(int(opt.Config.AggressivePointsPerBlock))
@@ -226,6 +231,7 @@ func NewEngine(id uint64, idx tsdb.Index, path string, walPath string, sfile *ts
 		logger:       zap.NewNop(),
 		traceLogger:  zap.NewNop(),
 		traceLogging: opt.Config.TraceLoggingEnabled,
+		configErr:    configErr,
 
 		WAL:   wal,
 		Cache: cache,
@@ -753,6 +759,9 @@ func (e *Engine) DiskSize() int64 {
 
 // Open opens and initializes the engine.
 func (e *Engine) Open(ctx context.Context) error {
+	if e.configErr != nil {
+		return fmt.Errorf("invalid TSM engine configuration: %w", e.configErr)
+	}
 	if err := os.MkdirAll(e.path, 0777); err != nil {
 		return err
 	}

@@ -21,6 +21,7 @@ wal-dir = "/var/lib/influxdb/wal"
 wal-fsync-delay = "10s"
 wal-flush-on-shutdown = true
 tsm-use-madv-willneed = true
+tsm-float-encoding = "bos"
 `, &c)
 	require.NoError(t, err)
 
@@ -30,6 +31,7 @@ tsm-use-madv-willneed = true
 	require.Equal(t, time.Duration(10*time.Second), time.Duration(c.WALFsyncDelay))
 	require.True(t, c.WALFlushOnShutdown)
 	require.True(t, c.TSMWillNeed)
+	require.Equal(t, "bos", c.TSMFloatEncoding)
 }
 
 func TestConfig_Validate_Error(t *testing.T) {
@@ -59,6 +61,12 @@ func TestConfig_Validate_Error(t *testing.T) {
 	if err := c.Validate(); err != nil {
 		t.Error(err)
 	}
+
+	c.TSMFloatEncoding = "dictionary"
+	if err := c.Validate(); err == nil || err.Error() != `unrecognized tsm-float-encoding "dictionary" (valid values: gorilla, bos, subcolumn)` {
+		t.Errorf("unexpected error: %s", err)
+	}
+	c.TSMFloatEncoding = tsdb.DefaultTSMFloatEncoding
 
 	c.SeriesIDSetCacheSize = -1
 	if err := c.Validate(); err == nil || err.Error() != "series-id-set-cache-size must be non-negative" {

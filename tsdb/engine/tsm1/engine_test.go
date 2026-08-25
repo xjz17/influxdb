@@ -371,6 +371,52 @@ func TestEngine_Digest_Concurrent(t *testing.T) {
 	}
 }
 
+func TestEngine_TSMFloatEncodingConfigSnapshot(t *testing.T) {
+	tests := []struct {
+		name    string
+		header  byte
+		wantErr bool
+	}{
+		{name: "bos", header: 2},
+		{name: "subcolumn", header: 3},
+		{name: "dictionary", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sfile := MustOpenSeriesFile(t)
+			defer sfile.Close()
+			root := t.TempDir()
+			dataPath := filepath.Join(root, "data")
+			walPath := filepath.Join(root, "wal")
+			require.NoError(t, os.MkdirAll(dataPath, 0o777))
+			require.NoError(t, os.MkdirAll(walPath, 0o777))
+
+			opt := tsdb.NewEngineOptions()
+			opt.Config.TSMFloatEncoding = tt.name
+			idx := tsdb.MustOpenIndex(1, path.Base(root), filepath.Join(root, "index"), tsdb.NewSeriesIDSet(), sfile.SeriesFile, opt)
+			defer idx.Close()
+
+			e := tsm1.NewEngine(1, idx, dataPath, walPath, sfile.SeriesFile, opt).(*tsm1.Engine)
+			e.CompactionPlan = &mockPlanner{}
+			require.Equal(t, tt.name, opt.Config.TSMFloatEncoding)
+			err := e.Open(context.Background())
+			if tt.wantErr {
+				require.ErrorContains(t, err, `invalid TSM engine configuration: unknown TSM float encoding "dictionary"`)
+				return
+			}
+			require.NoError(t, err)
+			defer e.Close(false)
+
+			points := MustParsePointsString("cpu,host=A value=1.25 1\ncpu,host=A value=2.5 2\ncpu,host=A value=5 3")
+			require.NoError(t, e.WritePoints(context.Background(), points))
+			require.NoError(t, e.WriteSnapshot())
+			require.Len(t, e.FileStore.Files(), 1)
+			requireTSMFloatEncoding(t, e.FileStore.Files()[0].Path(), tt.header)
+		})
+	}
+}
+
 // Ensure that the engine will backup any TSM files created since the passed in time
 func TestEngine_Backup(t *testing.T) {
 	sfile := MustOpenSeriesFile(t)

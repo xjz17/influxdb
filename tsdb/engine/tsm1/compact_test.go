@@ -2,6 +2,7 @@ package tsm1_test
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -96,6 +97,185 @@ func TestCompactor_Snapshot(t *testing.T) {
 			assertValueEqual(t, values[i], point)
 		}
 	}
+}
+
+func TestCompactor_FloatEncodingSnapshot(t *testing.T) {
+	tests := []struct {
+		name     string
+		encoding tsm1.FloatArrayEncoding
+		header   byte
+	}{
+		{name: "bos", encoding: tsm1.FloatArrayEncodingBOS, header: 2},
+		{name: "subcolumn", encoding: tsm1.FloatArrayEncodingSubcolumn, header: 3},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			cache := tsm1.NewCache(0, tsdb.EngineTags{})
+			values := make([]tsm1.Value, 32)
+			for i := range values {
+				values[i] = tsm1.NewFloatValue(int64(i), math.Float64frombits(uint64(i)*0x9e3779b97f4a7c15))
+			}
+			require.NoError(t, cache.Write([]byte("cpu#!~#value"), values))
+
+			fs := &fakeFileStore{}
+			t.Cleanup(func() { require.NoError(t, fs.Close()) })
+			compactor := tsm1.NewCompactor()
+			compactor.Dir = dir
+			compactor.FileStore = fs
+			compactor.FloatEncoding = tt.encoding
+			compactor.Open()
+
+			files, err := compactor.WriteSnapshot(cache, zap.NewNop())
+			require.NoError(t, err)
+			require.Len(t, files, 1)
+			requireTSMFloatEncoding(t, files[0], tt.header)
+		})
+	}
+}
+
+func TestCompactor_FloatEncodingRewrite(t *testing.T) {
+	codecs := []struct {
+		name     string
+		encoding tsm1.FloatArrayEncoding
+		header   byte
+	}{
+		{name: "bos", encoding: tsm1.FloatArrayEncodingBOS, header: 2},
+		{name: "subcolumn", encoding: tsm1.FloatArrayEncodingSubcolumn, header: 3},
+	}
+	modes := []struct {
+		name      string
+		fileCount int
+		fast      bool
+	}{
+		{name: "full-two-blocks", fileCount: 2},
+		{name: "fast-two-blocks", fileCount: 2, fast: true},
+		{name: "single-full-block", fileCount: 1},
+	}
+
+	for _, codec := range codecs {
+		for _, mode := range modes {
+			t.Run(codec.name+"/"+mode.name, func(t *testing.T) {
+				dir := t.TempDir()
+				key := "cpu#!~#value"
+				inputFiles := make([]string, 0, mode.fileCount)
+				for fileIndex := 0; fileIndex < mode.fileCount; fileIndex++ {
+					values := make([]tsm1.Value, 4)
+					for i := range values {
+						timestamp := int64(fileIndex*len(values) + i)
+						values[i] = tsm1.NewFloatValue(timestamp, math.Ldexp(1.25, int(timestamp)))
+					}
+					inputFiles = append(inputFiles, MustWriteTSM(t, dir, fileIndex+1, map[string][]tsm1.Value{key: values}))
+				}
+
+				fs := &fakeFileStore{}
+				t.Cleanup(func() { require.NoError(t, fs.Close()) })
+				compactor := tsm1.NewCompactor()
+				compactor.Dir = dir
+				compactor.FileStore = fs
+				compactor.FloatEncoding = codec.encoding
+				compactor.Open()
+
+				var files []string
+				var err error
+				if mode.fast {
+					files, err = compactor.CompactFast(inputFiles, zap.NewNop(), 4)
+				} else {
+					files, err = compactor.CompactFull(inputFiles, zap.NewNop(), 4)
+				}
+				require.NoError(t, err)
+				require.NotEmpty(t, files)
+				for _, file := range files {
+					requireTSMFloatEncoding(t, file, codec.header)
+				}
+			})
+		}
+	}
+}
+
+func TestCompactor_FloatEncodingRewritePreservesIntegerBlocks(t *testing.T) {
+	dir := t.TempDir()
+	input := MustWriteTSM(t, dir, 1, map[string][]tsm1.Value{
+		"cpu#!~#float": {
+			tsm1.NewFloatValue(0, 1.25),
+			tsm1.NewFloatValue(1, 2.5),
+			tsm1.NewFloatValue(2, 5),
+			tsm1.NewFloatValue(3, 10),
+		},
+		"cpu#!~#integer": {
+			tsm1.NewIntegerValue(0, 10),
+			tsm1.NewIntegerValue(1, 20),
+			tsm1.NewIntegerValue(2, 30),
+			tsm1.NewIntegerValue(3, 40),
+		},
+	})
+	integerBefore := readTSMBlocksOfType(t, input, tsm1.BlockInteger)
+
+	fs := &fakeFileStore{}
+	t.Cleanup(func() { require.NoError(t, fs.Close()) })
+	compactor := tsm1.NewCompactor()
+	compactor.Dir = dir
+	compactor.FileStore = fs
+	compactor.FloatEncoding = tsm1.FloatArrayEncodingBOS
+	compactor.Open()
+
+	files, err := compactor.CompactFast([]string{input}, zap.NewNop(), 4)
+	require.NoError(t, err)
+	require.NotEmpty(t, files)
+	var integerAfter [][]byte
+	for _, file := range files {
+		requireTSMFloatEncoding(t, file, 2)
+		integerAfter = append(integerAfter, readTSMBlocksOfType(t, file, tsm1.BlockInteger)...)
+	}
+	require.Equal(t, integerBefore, integerAfter)
+}
+
+func readTSMBlocksOfType(t *testing.T, path string, want byte) [][]byte {
+	t.Helper()
+	r := MustOpenTSMReader(path)
+	defer func() { require.NoError(t, r.Close()) }()
+	var result [][]byte
+	iter := r.BlockIterator()
+	for iter.Next() {
+		_, _, _, typ, _, block, err := iter.Read()
+		require.NoError(t, err)
+		if typ == want {
+			result = append(result, append([]byte(nil), block...))
+		}
+	}
+	require.NoError(t, iter.Err())
+	require.NotEmpty(t, result)
+	return result
+}
+
+func requireTSMFloatEncoding(t *testing.T, path string, want byte) {
+	t.Helper()
+	r := MustOpenTSMReader(path)
+	t.Cleanup(func() { require.NoError(t, r.Close()) })
+	iter := r.BlockIterator()
+	count := 0
+	for iter.Next() {
+		_, _, _, typ, _, block, err := iter.Read()
+		require.NoError(t, err)
+		if typ != byte(tsm1.BlockFloat64) {
+			continue
+		}
+		require.NotEmpty(t, block)
+		require.Equal(t, byte(tsm1.BlockFloat64), block[0])
+		tsLen, n := binary.Uvarint(block[1:])
+		require.Greater(t, n, 0)
+		valueOffset := 1 + n + int(tsLen)
+		require.Less(t, valueOffset, len(block))
+		require.Equal(t, want, block[valueOffset]>>4)
+
+		var decoded tsdb.FloatArray
+		require.NoError(t, tsm1.DecodeFloatArrayBlock(block, &decoded))
+		require.NotEmpty(t, decoded.Values)
+		count++
+	}
+	require.NoError(t, iter.Err())
+	require.Positive(t, count)
 }
 
 func TestCompactor_CompactFullLastTimestamp(t *testing.T) {

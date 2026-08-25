@@ -777,6 +777,10 @@ type Compactor struct {
 
 	FileStore fileStore
 
+	// FloatEncoding selects the value codec for float blocks newly encoded by
+	// snapshots and compactions. It defaults to the upstream Gorilla codec.
+	FloatEncoding FloatArrayEncoding
+
 	// RateLimit is the limit for disk writes for all concurrent compactions.
 	RateLimit limiter.Rate
 
@@ -803,6 +807,7 @@ type Compactor struct {
 func NewCompactor() *Compactor {
 	return &Compactor{
 		formatFileName: DefaultFormatFileName,
+		FloatEncoding:  FloatArrayEncodingGorilla,
 	}
 }
 
@@ -925,7 +930,7 @@ func (c *Compactor) WriteSnapshot(cache *Cache, logger *zap.Logger) ([]string, e
 	resC := make(chan res, concurrency)
 	for i := 0; i < concurrency; i++ {
 		go func(sp *Cache) {
-			iter := NewCacheKeyIterator(sp, tsdb.DefaultMaxPointsPerBlock, intC)
+			iter := NewCacheKeyIteratorWithFloatEncoding(sp, tsdb.DefaultMaxPointsPerBlock, intC, c.FloatEncoding)
 			files, err := c.writeNewFiles(c.FileStore.NextGeneration(), 0, nil, iter, throttle, logger)
 			resC <- res{files: files, err: err}
 
@@ -1023,7 +1028,7 @@ func (c *Compactor) compact(fast bool, tsmFiles []string, logger *zap.Logger, po
 		return nil, nil
 	}
 
-	tsm, err := NewTSMBatchKeyIterator(size, fast, DefaultMaxSavedErrors, intC, tsmFiles, trs...)
+	tsm, err := NewTSMBatchKeyIteratorWithFloatEncoding(size, fast, DefaultMaxSavedErrors, intC, tsmFiles, c.FloatEncoding, trs...)
 	if err != nil {
 		return nil, err
 	}
@@ -1431,6 +1436,10 @@ type tsmBatchKeyIterator struct {
 	// size is the maximum number of values to encode in a single block
 	size int
 
+	// floatEncoding is the configured value codec for float blocks that this
+	// iterator must newly encode.
+	floatEncoding FloatArrayEncoding
+
 	// key is the current key lowest key across all readers that has not be fully exhausted
 	// of values.
 	key []byte
@@ -1485,6 +1494,12 @@ func (t *tsmBatchKeyIterator) AppendError(err error) bool {
 // NewTSMBatchKeyIterator returns a new TSM key iterator from readers.
 // size indicates the maximum number of values to encode in a single block.
 func NewTSMBatchKeyIterator(size int, fast bool, maxErrors int, interrupt chan struct{}, tsmFiles []string, readers ...*TSMReader) (KeyIterator, error) {
+	return NewTSMBatchKeyIteratorWithFloatEncoding(size, fast, maxErrors, interrupt, tsmFiles, FloatArrayEncodingGorilla, readers...)
+}
+
+// NewTSMBatchKeyIteratorWithFloatEncoding returns a TSM key iterator that
+// re-encodes rewritten float blocks with the requested value codec.
+func NewTSMBatchKeyIteratorWithFloatEncoding(size int, fast bool, maxErrors int, interrupt chan struct{}, tsmFiles []string, floatEncoding FloatArrayEncoding, readers ...*TSMReader) (KeyIterator, error) {
 	var iter []*BlockIterator
 	for _, r := range readers {
 		iter = append(iter, r.BlockIterator())
@@ -1496,6 +1511,7 @@ func NewTSMBatchKeyIterator(size int, fast bool, maxErrors int, interrupt chan s
 		pos:                  make([]int, len(readers)),
 		errSet:               map[string]struct{}{},
 		size:                 size,
+		floatEncoding:        floatEncoding,
 		iterators:            iter,
 		fast:                 fast,
 		tsmFiles:             tsmFiles,
@@ -1508,6 +1524,30 @@ func NewTSMBatchKeyIterator(size int, fast bool, maxErrors int, interrupt chan s
 		interrupt:            interrupt,
 		maxErrors:            maxErrors,
 	}, nil
+}
+
+func (k *tsmBatchKeyIterator) encodeFloatArrayBlock(a *tsdb.FloatArray, b []byte) ([]byte, error) {
+	return EncodeFloatArrayBlockWithEncoding(a, b, k.floatEncoding)
+}
+
+func (k *tsmBatchKeyIterator) blockUsesConfiguredEncoding(b []byte) bool {
+	if k.typ != BlockFloat64 {
+		return true
+	}
+	if len(b) < 2 || b[0] != BlockFloat64 {
+		return false
+	}
+	_, values, err := unpackBlock(b[1:])
+	return err == nil && len(values) > 0 && FloatArrayEncoding(values[0]>>4) == k.floatEncoding
+}
+
+func (k *tsmBatchKeyIterator) blocksUseConfiguredEncoding(src blocks) bool {
+	for _, b := range src {
+		if !b.read() && !k.blockUsesConfiguredEncoding(b.b) {
+			return false
+		}
+	}
+	return true
 }
 
 func (k *tsmBatchKeyIterator) hasMergedValues() bool {
@@ -1747,6 +1787,8 @@ type cacheKeyIterator struct {
 	size  int
 	order [][]byte
 
+	floatEncoding FloatArrayEncoding
+
 	i         int
 	blocks    [][]cacheBlock
 	ready     []chan struct{}
@@ -1763,6 +1805,12 @@ type cacheBlock struct {
 
 // NewCacheKeyIterator returns a new KeyIterator from a Cache.
 func NewCacheKeyIterator(cache *Cache, size int, interrupt chan struct{}) KeyIterator {
+	return NewCacheKeyIteratorWithFloatEncoding(cache, size, interrupt, FloatArrayEncodingGorilla)
+}
+
+// NewCacheKeyIteratorWithFloatEncoding returns a cache iterator that encodes
+// new float blocks with the requested value codec.
+func NewCacheKeyIteratorWithFloatEncoding(cache *Cache, size int, interrupt chan struct{}, floatEncoding FloatArrayEncoding) KeyIterator {
 	keys := cache.Keys()
 
 	chans := make([]chan struct{}, len(keys))
@@ -1771,13 +1819,14 @@ func NewCacheKeyIterator(cache *Cache, size int, interrupt chan struct{}) KeyIte
 	}
 
 	cki := &cacheKeyIterator{
-		i:         -1,
-		size:      size,
-		cache:     cache,
-		order:     keys,
-		ready:     chans,
-		blocks:    make([][]cacheBlock, len(keys)),
-		interrupt: interrupt,
+		i:             -1,
+		size:          size,
+		cache:         cache,
+		order:         keys,
+		ready:         chans,
+		blocks:        make([][]cacheBlock, len(keys)),
+		interrupt:     interrupt,
+		floatEncoding: floatEncoding,
 	}
 	go cki.encode()
 	return cki
@@ -1808,6 +1857,7 @@ func (c *cacheKeyIterator) encode() {
 			uenc := getUnsignedEncoder(tsdb.DefaultMaxPointsPerBlock)
 			senc := getStringEncoder(tsdb.DefaultMaxPointsPerBlock)
 			ienc := getIntegerEncoder(tsdb.DefaultMaxPointsPerBlock)
+			var floatArray tsdb.FloatArray
 
 			defer putTimeEncoder(tenc)
 			defer putFloatEncoder(fenc)
@@ -1839,7 +1889,22 @@ func (c *cacheKeyIterator) encode() {
 
 					switch values[0].(type) {
 					case FloatValue:
-						b, err = encodeFloatBlockUsing(nil, values[:end], tenc, fenc)
+						if c.floatEncoding == FloatArrayEncodingGorilla {
+							b, err = encodeFloatBlockUsing(nil, values[:end], tenc, fenc)
+						} else {
+							if cap(floatArray.Timestamps) < end {
+								floatArray.Timestamps = make([]int64, end)
+								floatArray.Values = make([]float64, end)
+							}
+							floatArray.Timestamps = floatArray.Timestamps[:end]
+							floatArray.Values = floatArray.Values[:end]
+							for j, value := range values[:end] {
+								fv := value.(FloatValue)
+								floatArray.Timestamps[j] = fv.unixnano
+								floatArray.Values[j] = fv.value
+							}
+							b, err = EncodeFloatArrayBlockWithEncoding(&floatArray, nil, c.floatEncoding)
+						}
 					case IntegerValue:
 						b, err = encodeIntegerBlockUsing(nil, values[:end], tenc, ienc)
 					case UnsignedValue:
