@@ -100,15 +100,15 @@ func TestFloatArraySubcolumnRejectsOversizedHeader(t *testing.T) {
 	payload := []byte{byte(floatCompressedSubcolumn << 4)}
 	payload = appendFloatExperimentalU32(payload, floatSubcolumnMaxValues+1)
 	payload = appendFloatExperimentalU32(payload, floatExperimentalBlockSize)
-	if _, err := floatArrayDecodeAllSubcolumn(payload, nil); err == nil {
-		t.Fatal("Sub-column decoder accepted an oversized value count")
+	if _, err := floatArrayDecodeAllSubcolumn(payload, nil); err == nil || err.Error() != "Sub-column float block contains too many values" {
+		t.Fatalf("oversized value count error: got %v", err)
 	}
 
 	payload = payload[:1]
 	payload = appendFloatExperimentalU32(payload, 0)
 	payload = appendFloatExperimentalU32(payload, floatExperimentalBlockSize+1)
-	if _, err := floatArrayDecodeAllSubcolumn(payload, nil); err == nil {
-		t.Fatal("Sub-column decoder accepted an invalid block size")
+	if _, err := floatArrayDecodeAllSubcolumn(payload, nil); err == nil || err.Error() != "Sub-column float block has an invalid block size" {
+		t.Fatalf("invalid block size error: got %v", err)
 	}
 }
 
