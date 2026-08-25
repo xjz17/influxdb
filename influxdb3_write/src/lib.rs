@@ -7,6 +7,7 @@
 pub(crate) mod async_collections;
 pub mod chunk;
 pub mod deleter;
+pub mod experimental_codecs;
 pub mod paths;
 pub mod persister;
 pub mod retention_period_handler;
