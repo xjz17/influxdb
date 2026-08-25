@@ -5,8 +5,13 @@ import (
 	"math"
 )
 
+// TSM normally limits a value block to 10,000 points. Keep a much larger
+// explicit wire limit so a corrupt header cannot request a multi-gigabyte
+// allocation before the payload is validated.
+const floatSubcolumnMaxValues = 1 << 20
+
 func floatArrayEncodeAllSubcolumn(src []float64, b []byte) ([]byte, error) {
-	if uint64(len(src)) > math.MaxUint32 {
+	if len(src) > floatSubcolumnMaxValues {
 		return nil, fmt.Errorf("Sub-column float block contains too many values")
 	}
 
@@ -143,9 +148,12 @@ func floatArrayDecodeAllSubcolumn(b []byte, dst []float64) ([]float64, error) {
 	if err != nil {
 		return nil, err
 	}
+	if total32 > floatSubcolumnMaxValues {
+		return nil, fmt.Errorf("Sub-column float block contains too many values")
+	}
 	blockSize := int(blockSize32)
-	if blockSize == 0 {
-		return nil, fmt.Errorf("Sub-column float block has a zero block size")
+	if blockSize != floatExperimentalBlockSize {
+		return nil, fmt.Errorf("Sub-column float block has an invalid block size")
 	}
 	total := int(total32)
 	if cap(dst) < total {

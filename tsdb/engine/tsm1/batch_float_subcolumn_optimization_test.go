@@ -40,12 +40,75 @@ func TestFloatArraySubcolumnOptimizedMatchesReference(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			optimizedDecoded, err := floatArrayDecodeAllSubcolumn(reference, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
 			for i := range values {
-				if math.Float64bits(decoded[i]) != math.Float64bits(values[i]) {
-					t.Fatalf("reference decoder mismatch at %d", i)
+				want := math.Float64bits(values[i])
+				if math.Float64bits(decoded[i]) != want || math.Float64bits(optimizedDecoded[i]) != want {
+					t.Fatalf("decoder mismatch at %d", i)
 				}
 			}
 		})
+	}
+}
+
+func TestFloatSubcolumnDictionaryWidthsMatchReference(t *testing.T) {
+	for width := uint8(0); width <= 4; width++ {
+		t.Run(fmt.Sprintf("width_%d", width), func(t *testing.T) {
+			distinct := 1 << width
+			values := make([]byte, 512)
+			for i := range values {
+				values[i] = byte(i % distinct)
+			}
+
+			mode, payload := referenceEncodeFloatSubcolumnGroup(values)
+			actual := appendFloatSubcolumnGroup(nil, values)
+			want := append([]byte{mode}, 0, 0, 0, 0)
+			want = appendFloatExperimentalU32(want[:1], uint32(len(payload)))
+			want = append(want, payload...)
+			if string(actual) != string(want) {
+				t.Fatalf("group payload differs from reference for width %d", width)
+			}
+
+			// Width four is a valid decoder input even though its dictionary
+			// overhead means the encoder normally chooses packed nibbles.
+			dictionaryPayload := referenceEncodeFloatSubcolumnDictionary(values)
+			if got := dictionaryPayload[1+distinct]; got != width {
+				t.Fatalf("reference dictionary width: got %d, want %d", got, width)
+			}
+			referenceDigits, err := referenceDecodeFloatSubcolumnGroup(2, dictionaryPayload, len(values))
+			if err != nil {
+				t.Fatal(err)
+			}
+			residuals := make([]uint64, len(values))
+			const shift = 12
+			if err = decodeFloatSubcolumnGroupInto(2, dictionaryPayload, residuals, shift); err != nil {
+				t.Fatal(err)
+			}
+			for i, digit := range referenceDigits {
+				if got := byte(residuals[i] >> shift); got != digit {
+					t.Fatalf("dictionary digit mismatch at %d: got %d, want %d", i, got, digit)
+				}
+			}
+		})
+	}
+}
+
+func TestFloatArraySubcolumnRejectsOversizedHeader(t *testing.T) {
+	payload := []byte{byte(floatCompressedSubcolumn << 4)}
+	payload = appendFloatExperimentalU32(payload, floatSubcolumnMaxValues+1)
+	payload = appendFloatExperimentalU32(payload, floatExperimentalBlockSize)
+	if _, err := floatArrayDecodeAllSubcolumn(payload, nil); err == nil {
+		t.Fatal("Sub-column decoder accepted an oversized value count")
+	}
+
+	payload = payload[:1]
+	payload = appendFloatExperimentalU32(payload, 0)
+	payload = appendFloatExperimentalU32(payload, floatExperimentalBlockSize+1)
+	if _, err := floatArrayDecodeAllSubcolumn(payload, nil); err == nil {
+		t.Fatal("Sub-column decoder accepted an invalid block size")
 	}
 }
 
@@ -85,6 +148,8 @@ func BenchmarkFloatArraySubcolumnOptimization(b *testing.B) {
 				b.Fatal(err)
 			}
 		}
+		b.StopTimer()
+		assertFloatBitsEqual(b, output, values)
 		b.SetBytes(int64(len(encoded)))
 	})
 	b.Run("decode_optimized", func(b *testing.B) {
@@ -97,8 +162,22 @@ func BenchmarkFloatArraySubcolumnOptimization(b *testing.B) {
 				b.Fatal(err)
 			}
 		}
+		b.StopTimer()
+		assertFloatBitsEqual(b, output, values)
 		b.SetBytes(int64(len(encoded)))
 	})
+}
+
+func assertFloatBitsEqual(tb testing.TB, got, want []float64) {
+	tb.Helper()
+	if len(got) != len(want) {
+		tb.Fatalf("decoded length: got %d, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if math.Float64bits(got[i]) != math.Float64bits(want[i]) {
+			tb.Fatalf("decoded bit mismatch at %d", i)
+		}
+	}
 }
 
 func referenceFloatArrayEncodeAllSubcolumn(src []float64, b []byte) []byte {
