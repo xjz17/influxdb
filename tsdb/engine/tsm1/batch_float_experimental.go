@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"math"
 	"math/bits"
-	"slices"
 	"sort"
 	"strings"
 )
@@ -100,7 +99,6 @@ func floatArrayEncodeAllBOS(src []float64, b []byte) ([]byte, error) {
 		}
 		blockSorted := sorted[:len(blockDeltas)]
 		copy(blockSorted, blockDeltas)
-		slices.Sort(blockSorted)
 		plan := chooseFloatBOSPlan(blockSorted)
 		bitmapLength := (len(blockDeltas) + 7) >> 3
 		inlierCount := len(blockDeltas) - plan.outlierCount
@@ -112,43 +110,77 @@ func floatArrayEncodeAllBOS(src []float64, b []byte) ([]byte, error) {
 		out = appendFloatExperimentalU32(out, uint32(packedLength))
 		out = appendFloatExperimentalU32(out, uint32(plan.outlierCount))
 		payloadStart := len(out)
-		out = append(out, make([]byte, bitmapLength+packedLength)...)
+		out = append(out, make([]byte, bitmapLength+packedLength+plan.outlierCount*8)...)
 		bitmap := out[payloadStart : payloadStart+bitmapLength]
-		packed := out[payloadStart+bitmapLength:]
+		packed := out[payloadStart+bitmapLength : payloadStart+bitmapLength+packedLength]
 		bitPosition := 0
+		outlierPosition := payloadStart + bitmapLength + packedLength
 		for i, delta := range blockDeltas {
 			if delta < plan.lower || delta > plan.upper {
 				bitmap[i>>3] |= 1 << (i & 7)
+				binary.BigEndian.PutUint64(out[outlierPosition:], uint64(delta))
+				outlierPosition += 8
 				continue
 			}
 			floatExperimentalWriteBitsMSB(packed, &bitPosition, uint64(delta)-uint64(plan.lower), plan.width)
-		}
-		for _, delta := range blockDeltas {
-			if delta < plan.lower || delta > plan.upper {
-				out = appendFloatExperimentalI64(out, delta)
-			}
 		}
 	}
 	return out, nil
 }
 
-func chooseFloatBOSPlan(sorted []int64) floatBOSPlan {
-	trims := [...]int{0, len(sorted) / 100, len(sorted) / 50, len(sorted) / 20, len(sorted) / 10}
-	var best floatBOSPlan
-	haveBest := false
+type floatBOSOrderStat struct {
+	rank  int
+	value int64
+	below int
+	above int
+}
+
+func chooseFloatBOSPlan(values []int64) floatBOSPlan {
+	trimCandidates := [...]int{0, len(values) / 100, len(values) / 50, len(values) / 20, len(values) / 10}
+	var trims [len(trimCandidates)]int
+	trimCount := 0
 	previousTrim := -1
-	for _, trim := range trims {
-		if trim == previousTrim || trim*2 >= len(sorted) {
+	for _, trim := range trimCandidates {
+		if trim == previousTrim || trim*2 >= len(values) {
 			continue
 		}
 		previousTrim = trim
-		lower := sorted[trim]
-		upper := sorted[len(sorted)-trim-1]
+		trims[trimCount] = trim
+		trimCount++
+	}
+
+	var ranks [len(trimCandidates) * 2]int
+	rankCount := 0
+	for _, trim := range trims[:trimCount] {
+		for _, rank := range [...]int{trim, len(values) - trim - 1} {
+			position := sort.Search(rankCount, func(i int) bool { return ranks[i] >= rank })
+			if position < rankCount && ranks[position] == rank {
+				continue
+			}
+			copy(ranks[position+1:rankCount+1], ranks[position:rankCount])
+			ranks[position] = rank
+			rankCount++
+		}
+	}
+	var statsStorage [len(ranks)]floatBOSOrderStat
+	stats := statsStorage[:rankCount]
+	for i, rank := range ranks[:rankCount] {
+		stats[i].rank = rank
+	}
+	selectFloatBOSOrderStats(values, 0, len(values), stats)
+
+	var best floatBOSPlan
+	haveBest := false
+	for _, trim := range trims[:trimCount] {
+		lowerRank := trim
+		upperRank := len(values) - trim - 1
+		lowerPosition := sort.Search(len(stats), func(i int) bool { return stats[i].rank >= lowerRank })
+		upperPosition := sort.Search(len(stats), func(i int) bool { return stats[i].rank >= upperRank })
+		lower := stats[lowerPosition].value
+		upper := stats[upperPosition].value
 		width := floatExperimentalBitWidth(uint64(upper) - uint64(lower))
-		below := sort.Search(len(sorted), func(i int) bool { return sorted[i] >= lower })
-		atMostUpper := sort.Search(len(sorted), func(i int) bool { return sorted[i] > upper })
-		outliers := below + len(sorted) - atMostUpper
-		inliers := len(sorted) - outliers
+		outliers := stats[lowerPosition].below + stats[upperPosition].above
+		inliers := len(values) - outliers
 		cost := uint64(floatExperimentalPackedByteLen(inliers, width)) + uint64(outliers)*8
 		candidate := floatBOSPlan{
 			lower: lower, upper: upper, width: width, outlierCount: outliers, cost: cost,
@@ -160,6 +192,51 @@ func chooseFloatBOSPlan(sorted []int64) floatBOSPlan {
 		}
 	}
 	return best
+}
+
+func selectFloatBOSOrderStats(values []int64, base, total int, stats []floatBOSOrderStat) {
+	if len(stats) == 0 {
+		return
+	}
+	pivot := floatBOSMedianOfThree(values[0], values[len(values)/2], values[len(values)-1])
+	less, position, greater := 0, 0, len(values)
+	for position < greater {
+		switch {
+		case values[position] < pivot:
+			values[less], values[position] = values[position], values[less]
+			less++
+			position++
+		case values[position] > pivot:
+			greater--
+			values[position], values[greater] = values[greater], values[position]
+		default:
+			position++
+		}
+	}
+	firstEqual := base + less
+	afterEqual := base + greater
+	leftEnd := sort.Search(len(stats), func(i int) bool { return stats[i].rank >= firstEqual })
+	rightStart := sort.Search(len(stats), func(i int) bool { return stats[i].rank >= afterEqual })
+	for i := leftEnd; i < rightStart; i++ {
+		stats[i].value = pivot
+		stats[i].below = firstEqual
+		stats[i].above = total - afterEqual
+	}
+	selectFloatBOSOrderStats(values[:less], base, total, stats[:leftEnd])
+	selectFloatBOSOrderStats(values[greater:], afterEqual, total, stats[rightStart:])
+}
+
+func floatBOSMedianOfThree(first, middle, last int64) int64 {
+	if first > middle {
+		first, middle = middle, first
+	}
+	if middle > last {
+		middle, last = last, middle
+	}
+	if first > middle {
+		middle = first
+	}
+	return middle
 }
 
 func floatArrayDecodeAllBOS(b []byte, dst []float64) ([]float64, error) {
@@ -250,22 +327,25 @@ func floatArrayDecodeAllBOS(b []byte, dst []float64) ([]float64, error) {
 		previous := uint64(first)
 		dst = append(dst, math.Float64frombits(previous))
 		bitPosition := 0
-		for i := 0; i < deltaCount; i++ {
-			var delta int64
-			if bitmap[i>>3]&(1<<(i&7)) != 0 {
-				delta, readErr = reader.readI64()
-				if readErr != nil {
-					return nil, readErr
+		deltaPosition := 0
+		for _, flags := range bitmap {
+			count := min(8, deltaCount-deltaPosition)
+			for range count {
+				var delta int64
+				if flags&1 != 0 {
+					delta, readErr = reader.readI64()
+					if readErr != nil {
+						return nil, readErr
+					}
+				} else {
+					value := floatExperimentalReadBitsMSBUnchecked(packed, &bitPosition, width)
+					delta = int64(uint64(lower) + value)
 				}
-			} else {
-				value, bitErr := floatExperimentalReadBitsMSB(packed, &bitPosition, width)
-				if bitErr != nil {
-					return nil, bitErr
-				}
-				delta = int64(uint64(lower) + value)
+				previous += uint64(delta)
+				dst = append(dst, math.Float64frombits(previous))
+				flags >>= 1
+				deltaPosition++
 			}
-			previous += uint64(delta)
-			dst = append(dst, math.Float64frombits(previous))
 		}
 	}
 	if reader.position != len(reader.data) {
@@ -284,43 +364,66 @@ func floatExperimentalPackedByteLen(count int, width uint8) int {
 
 func floatExperimentalWriteBitsMSB(data []byte, bitPosition *int, value uint64, width uint8) {
 	remaining := int(width)
-	for remaining > 0 {
-		bitOffset := *bitPosition & 7
+	if remaining == 0 {
+		return
+	}
+	bitOffset := *bitPosition & 7
+	if bitOffset != 0 {
 		take := min(8-bitOffset, remaining)
 		shift := remaining - take
 		mask := uint64((1 << take) - 1)
-		chunk := byte((value >> shift) & mask)
-		data[*bitPosition>>3] |= chunk << (8 - bitOffset - take)
+		data[*bitPosition>>3] |= byte((value>>shift)&mask) << (8 - bitOffset - take)
 		*bitPosition += take
 		remaining -= take
-		if bitOffset == 0 && remaining >= 8 {
-			wholeBytes := remaining >> 3
-			for range wholeBytes {
-				shift = remaining - 8
-				data[*bitPosition>>3] = byte(value >> shift)
-				*bitPosition += 8
-				remaining -= 8
-			}
-		}
+	}
+	for remaining >= 8 {
+		remaining -= 8
+		data[*bitPosition>>3] = byte(value >> remaining)
+		*bitPosition += 8
+	}
+	if remaining > 0 {
+		mask := uint64((1 << remaining) - 1)
+		data[*bitPosition>>3] |= byte(value&mask) << (8 - remaining)
+		*bitPosition += remaining
 	}
 }
 
 func floatExperimentalReadBitsMSB(data []byte, bitPosition *int, width uint8) (uint64, error) {
-	var value uint64
 	remaining := int(width)
-	for remaining > 0 {
-		if *bitPosition>>3 >= len(data) {
-			return 0, fmt.Errorf("truncated float bit-packed payload")
-		}
-		bitOffset := *bitPosition & 7
+	if remaining == 0 {
+		return 0, nil
+	}
+	if *bitPosition < 0 || *bitPosition > len(data)*8-remaining {
+		return 0, fmt.Errorf("truncated float bit-packed payload")
+	}
+	return floatExperimentalReadBitsMSBUnchecked(data, bitPosition, width), nil
+}
+
+func floatExperimentalReadBitsMSBUnchecked(data []byte, bitPosition *int, width uint8) uint64 {
+	remaining := int(width)
+	if remaining == 0 {
+		return 0
+	}
+	var value uint64
+	bitOffset := *bitPosition & 7
+	if bitOffset != 0 {
 		take := min(8-bitOffset, remaining)
 		shift := 8 - bitOffset - take
 		mask := byte((1 << take) - 1)
-		value = (value << take) | uint64((data[*bitPosition>>3]>>shift)&mask)
+		value = uint64((data[*bitPosition>>3] >> shift) & mask)
 		*bitPosition += take
 		remaining -= take
 	}
-	return value, nil
+	for remaining >= 8 {
+		value = value<<8 | uint64(data[*bitPosition>>3])
+		*bitPosition += 8
+		remaining -= 8
+	}
+	if remaining > 0 {
+		value = value<<remaining | uint64(data[*bitPosition>>3]>>(8-remaining))
+		*bitPosition += remaining
+	}
+	return value
 }
 
 func appendFloatExperimentalU32(out []byte, value uint32) []byte {

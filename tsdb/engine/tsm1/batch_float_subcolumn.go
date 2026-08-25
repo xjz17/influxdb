@@ -20,7 +20,6 @@ func floatArrayEncodeAllSubcolumn(src []float64, b []byte) ([]byte, error) {
 	out = appendFloatExperimentalU32(out, uint32(len(src)))
 	out = appendFloatExperimentalU32(out, floatExperimentalBlockSize)
 	residuals := make([]uint64, floatExperimentalBlockSize)
-	digits := make([]byte, floatExperimentalBlockSize)
 	for offset := 0; offset < len(src); offset += floatExperimentalBlockSize {
 		blockLength := min(floatExperimentalBlockSize, len(src)-offset)
 		minimum := int64(math.Float64bits(src[offset]))
@@ -42,43 +41,55 @@ func floatArrayEncodeAllSubcolumn(src []float64, b []byte) ([]byte, error) {
 		out = appendFloatExperimentalU32(out, uint32(blockLength))
 		out = appendFloatExperimentalI64(out, minimum)
 		out = append(out, byte(groups))
-		blockDigits := digits[:blockLength]
 		for group := 0; group < groups; group++ {
-			shift := group * 4
-			for i, value := range blockResiduals {
-				blockDigits[i] = byte(value>>shift) & 0xf
-			}
-			out = appendFloatSubcolumnGroup(out, blockDigits)
+			out = appendFloatSubcolumnGroup(out, blockResiduals, group*4)
 		}
 	}
 	return out, nil
 }
 
-func appendFloatSubcolumnGroup(out []byte, values []byte) []byte {
-	packedLength := (len(values) + 1) / 2
-	runs := 0
-	for start := 0; start < len(values); {
-		end := start + 1
-		for end < len(values) && values[end] == values[start] {
-			end++
-		}
-		runs++
-		start = end
-	}
-	rleLength := runs * 5
-
+func appendFloatSubcolumnGroup(out []byte, residuals []uint64, shift int) []byte {
+	packedLength := (len(residuals) + 1) / 2
 	indexes := [16]int8{-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1}
 	var dictionary [16]byte
 	dictionaryLength := 0
-	for _, value := range values {
-		if indexes[value] < 0 {
+	runs := 0
+	previous := byte(0)
+	rleCandidate := true
+	dictionaryCandidate := true
+	for i, residual := range residuals {
+		value := byte(residual>>shift) & 0xf
+		if rleCandidate && (i == 0 || value != previous) {
+			runs++
+			previous = value
+			if runs*5 >= packedLength {
+				rleCandidate = false
+			}
+		}
+		if dictionaryCandidate && indexes[value] < 0 {
 			indexes[value] = int8(dictionaryLength)
 			dictionary[dictionaryLength] = value
 			dictionaryLength++
+			width := floatExperimentalBitWidth(uint64(dictionaryLength - 1))
+			minimumLength := 1 + dictionaryLength + 1 + floatExperimentalPackedByteLen(len(residuals), width)
+			if minimumLength >= packedLength {
+				dictionaryCandidate = false
+			}
+		}
+		if !rleCandidate && !dictionaryCandidate {
+			break
 		}
 	}
-	width := floatExperimentalBitWidth(uint64(dictionaryLength - 1))
-	dictionaryLengthBytes := 1 + dictionaryLength + 1 + floatExperimentalPackedByteLen(len(values), width)
+	rleLength := packedLength + 1
+	if rleCandidate {
+		rleLength = runs * 5
+	}
+	width := uint8(0)
+	dictionaryLengthBytes := packedLength + 1
+	if dictionaryCandidate {
+		width = floatExperimentalBitWidth(uint64(dictionaryLength - 1))
+		dictionaryLengthBytes = 1 + dictionaryLength + 1 + floatExperimentalPackedByteLen(len(residuals), width)
+	}
 
 	mode := byte(0)
 	payloadLength := packedLength
@@ -96,16 +107,23 @@ func appendFloatSubcolumnGroup(out []byte, values []byte) []byte {
 	case 0:
 		payloadStart := len(out)
 		out = append(out, make([]byte, packedLength)...)
-		for i, value := range values {
-			out[payloadStart+i/2] |= (value & 0xf) << ((i & 1) * 4)
+		i := 0
+		for ; i+1 < len(residuals); i += 2 {
+			low := byte(residuals[i]>>shift) & 0xf
+			high := byte(residuals[i+1]>>shift) & 0xf
+			out[payloadStart+i/2] = low | high<<4
+		}
+		if i < len(residuals) {
+			out[payloadStart+i/2] = byte(residuals[i]>>shift) & 0xf
 		}
 	case 1:
-		for start := 0; start < len(values); {
+		for start := 0; start < len(residuals); {
+			value := byte(residuals[start]>>shift) & 0xf
 			end := start + 1
-			for end < len(values) && values[end] == values[start] {
+			for end < len(residuals) && byte(residuals[end]>>shift)&0xf == value {
 				end++
 			}
-			out = append(out, values[start])
+			out = append(out, value)
 			out = appendFloatExperimentalU32(out, uint32(end-start))
 			start = end
 		}
@@ -113,22 +131,25 @@ func appendFloatSubcolumnGroup(out []byte, values []byte) []byte {
 		out = append(out, byte(dictionaryLength))
 		out = append(out, dictionary[:dictionaryLength]...)
 		out = append(out, width)
-		packedLength := floatExperimentalPackedByteLen(len(values), width)
+		packedLength := floatExperimentalPackedByteLen(len(residuals), width)
 		payloadStart := len(out)
 		out = append(out, make([]byte, packedLength)...)
 		if width == 0 {
 			break
 		}
-		bitPosition := 0
-		for _, value := range values {
-			index := byte(indexes[value])
-			bytePosition := bitPosition >> 3
-			bitOffset := bitPosition & 7
-			out[payloadStart+bytePosition] |= index << bitOffset
-			if bitOffset+int(width) > 8 {
-				out[payloadStart+bytePosition+1] |= index >> (8 - bitOffset)
+		payloadPosition := payloadStart
+		for start := 0; start < len(residuals); start += 8 {
+			count := min(8, len(residuals)-start)
+			var word uint32
+			for offset := 0; offset < count; offset++ {
+				value := byte(residuals[start+offset]>>shift) & 0xf
+				word |= uint32(byte(indexes[value])) << (offset * int(width))
 			}
-			bitPosition += int(width)
+			bytes := (count*int(width) + 7) / 8
+			for offset := 0; offset < bytes; offset++ {
+				out[payloadPosition+offset] = byte(word >> (offset * 8))
+			}
+			payloadPosition += bytes
 		}
 	}
 	return out
@@ -179,6 +200,7 @@ func floatArrayDecodeAllSubcolumn(b []byte, dst []float64) ([]float64, error) {
 		}
 		blockResiduals := residuals[:length]
 		clear(blockResiduals)
+		var constantResidual uint64
 		for group := 0; group < groups; group++ {
 			mode, groupErr := reader.readU8()
 			if groupErr != nil {
@@ -192,12 +214,16 @@ func floatArrayDecodeAllSubcolumn(b []byte, dst []float64) ([]float64, error) {
 			if groupErr != nil {
 				return nil, groupErr
 			}
+			if mode == 2 && len(payload) == 3 && payload[0] == 1 && payload[1] <= 0xf && payload[2] == 0 {
+				constantResidual |= uint64(payload[1]) << (group * 4)
+				continue
+			}
 			if groupErr = decodeFloatSubcolumnGroupInto(mode, payload, blockResiduals, group*4); groupErr != nil {
 				return nil, groupErr
 			}
 		}
 		for _, residual := range blockResiduals {
-			value := uint64(minimum) + residual
+			value := uint64(minimum) + (residual | constantResidual)
 			dst = append(dst, math.Float64frombits(value))
 		}
 	}
@@ -213,9 +239,14 @@ func decodeFloatSubcolumnGroupInto(mode byte, payload []byte, residuals []uint64
 		if len(payload) != (len(residuals)+1)/2 {
 			return fmt.Errorf("Sub-column packed digit length is invalid")
 		}
-		for i := range residuals {
-			digit := (payload[i/2] >> ((i & 1) * 4)) & 0xf
-			residuals[i] |= uint64(digit) << shift
+		position := 0
+		for _, value := range payload {
+			residuals[position] |= uint64(value&0xf) << shift
+			position++
+			if position < len(residuals) {
+				residuals[position] |= uint64(value>>4) << shift
+				position++
+			}
 		}
 		return nil
 	case 1:
@@ -281,21 +312,24 @@ func decodeFloatSubcolumnDictionaryInto(payload []byte, residuals []uint64, shif
 		}
 		return nil
 	}
-	mask := uint16((1 << width) - 1)
-	bitPosition := 0
-	for i := range residuals {
-		bytePosition := bitPosition >> 3
-		bitOffset := bitPosition & 7
-		word := uint16(packed[bytePosition])
-		if bitOffset+int(width) > 8 {
-			word |= uint16(packed[bytePosition+1]) << 8
+	mask := uint32((1 << width) - 1)
+	payloadPosition := 0
+	for start := 0; start < len(residuals); start += 8 {
+		count := min(8, len(residuals)-start)
+		bytes := (count*int(width) + 7) / 8
+		var word uint32
+		for offset := 0; offset < bytes; offset++ {
+			word |= uint32(packed[payloadPosition+offset]) << (offset * 8)
 		}
-		index := int((word >> bitOffset) & mask)
-		if index >= len(dictionary) {
-			return fmt.Errorf("Sub-column dictionary index is invalid")
+		for offset := 0; offset < count; offset++ {
+			index := int(word & mask)
+			if index >= len(dictionary) {
+				return fmt.Errorf("Sub-column dictionary index is invalid")
+			}
+			residuals[start+offset] |= uint64(dictionary[index]) << shift
+			word >>= width
 		}
-		residuals[i] |= uint64(dictionary[index]) << shift
-		bitPosition += int(width)
+		payloadPosition += bytes
 	}
 	return nil
 }

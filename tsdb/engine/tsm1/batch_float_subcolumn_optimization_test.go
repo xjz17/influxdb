@@ -59,12 +59,15 @@ func TestFloatSubcolumnDictionaryWidthsMatchReference(t *testing.T) {
 		t.Run(fmt.Sprintf("width_%d", width), func(t *testing.T) {
 			distinct := 1 << width
 			values := make([]byte, 512)
+			residuals := make([]uint64, len(values))
+			const shift = 12
 			for i := range values {
 				values[i] = byte(i % distinct)
+				residuals[i] = uint64(values[i]) << shift
 			}
 
 			mode, payload := referenceEncodeFloatSubcolumnGroup(values)
-			actual := appendFloatSubcolumnGroup(nil, values)
+			actual := appendFloatSubcolumnGroup(nil, residuals, shift)
 			want := append([]byte{mode}, 0, 0, 0, 0)
 			want = appendFloatExperimentalU32(want[:1], uint32(len(payload)))
 			want = append(want, payload...)
@@ -82,13 +85,12 @@ func TestFloatSubcolumnDictionaryWidthsMatchReference(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			residuals := make([]uint64, len(values))
-			const shift = 12
-			if err = decodeFloatSubcolumnGroupInto(2, dictionaryPayload, residuals, shift); err != nil {
+			decodedResiduals := make([]uint64, len(values))
+			if err = decodeFloatSubcolumnGroupInto(2, dictionaryPayload, decodedResiduals, shift); err != nil {
 				t.Fatal(err)
 			}
 			for i, digit := range referenceDigits {
-				if got := byte(residuals[i] >> shift); got != digit {
+				if got := byte(decodedResiduals[i] >> shift); got != digit {
 					t.Fatalf("dictionary digit mismatch at %d: got %d, want %d", i, got, digit)
 				}
 			}

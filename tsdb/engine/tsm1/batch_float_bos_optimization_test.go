@@ -35,6 +35,89 @@ func TestFloatArrayBOSOptimizedMatchesReference(t *testing.T) {
 	}
 }
 
+func TestFloatExperimentalMSBBitsMatchReference(t *testing.T) {
+	state := uint64(0x123456789abcdef0)
+	for width := uint8(0); width <= 64; width++ {
+		values := make([]uint64, 67)
+		for i := range values {
+			state ^= state << 13
+			state ^= state >> 7
+			state ^= state << 17
+			values[i] = state
+			if width < 64 {
+				values[i] &= (uint64(1) << width) - 1
+			}
+		}
+		want := referencePackBitsMSB(values, width)
+		got := make([]byte, len(want))
+		position := 0
+		for _, value := range values {
+			floatExperimentalWriteBitsMSB(got, &position, value, width)
+		}
+		if string(got) != string(want) {
+			t.Fatalf("width %d packed bytes differ", width)
+		}
+		position = 0
+		for i, value := range values {
+			decoded, err := floatExperimentalReadBitsMSB(got, &position, width)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if decoded != value {
+				t.Fatalf("width %d value %d: got %x, want %x", width, i, decoded, value)
+			}
+		}
+	}
+}
+
+func TestChooseFloatBOSPlanMatchesReference(t *testing.T) {
+	state := uint64(0x123456789abcdef0)
+	for length := 1; length <= floatExperimentalBlockSize-1; length++ {
+		values := make([]int64, length)
+		for i := range values {
+			state ^= state << 13
+			state ^= state >> 7
+			state ^= state << 17
+			if length%3 == 0 {
+				values[i] = int64(state % 17)
+			} else {
+				values[i] = int64(state)
+			}
+		}
+		want := referenceChooseFloatBOSPlan(values)
+		working := append([]int64(nil), values...)
+		if got := chooseFloatBOSPlan(working); got != want {
+			t.Fatalf("length %d plan: got %+v, want %+v", length, got, want)
+		}
+	}
+	for name, values := range map[string][]int64{
+		"all_equal": make([]int64, floatExperimentalBlockSize-1),
+		"ascending": func() []int64 {
+			values := make([]int64, floatExperimentalBlockSize-1)
+			for i := range values {
+				values[i] = int64(i) - 255
+			}
+			return values
+		}(),
+		"descending": func() []int64 {
+			values := make([]int64, floatExperimentalBlockSize-1)
+			for i := range values {
+				values[i] = 255 - int64(i)
+			}
+			return values
+		}(),
+		"extremes": {math.MinInt64, math.MaxInt64, 0, math.MinInt64, math.MaxInt64},
+	} {
+		t.Run(name, func(t *testing.T) {
+			want := referenceChooseFloatBOSPlan(values)
+			working := append([]int64(nil), values...)
+			if got := chooseFloatBOSPlan(working); got != want {
+				t.Fatalf("plan: got %+v, want %+v", got, want)
+			}
+		})
+	}
+}
+
 func BenchmarkFloatArrayBOSOptimization(b *testing.B) {
 	values := make([]float64, 128*1024)
 	for i := range values {
