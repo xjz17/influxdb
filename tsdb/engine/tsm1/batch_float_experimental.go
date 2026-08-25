@@ -13,6 +13,7 @@ const (
 	floatCompressedBOS         = 2
 	floatCompressedSubcolumn   = 3
 	floatExperimentalBlockSize = 512
+	floatBOSMaxValues          = 1 << 20
 )
 
 // FloatArrayEncoding identifies a value encoding stored in the high nibble of
@@ -65,7 +66,7 @@ type floatBOSPlan struct {
 }
 
 func floatArrayEncodeAllBOS(src []float64, b []byte) ([]byte, error) {
-	if uint64(len(src)) > math.MaxUint32 {
+	if len(src) > floatBOSMaxValues {
 		return nil, fmt.Errorf("BOS float block contains too many values")
 	}
 
@@ -259,9 +260,12 @@ func floatArrayDecodeAllBOS(b []byte, dst []float64) ([]float64, error) {
 	if err != nil {
 		return nil, err
 	}
+	if total32 > floatBOSMaxValues {
+		return nil, fmt.Errorf("BOS float block contains too many values")
+	}
 	blockSize := int(blockSize32)
-	if blockSize == 0 {
-		return nil, fmt.Errorf("BOS float block has a zero block size")
+	if blockSize != floatExperimentalBlockSize {
+		return nil, fmt.Errorf("BOS float block has an invalid block size")
 	}
 	total := int(total32)
 	if cap(dst) < total {
