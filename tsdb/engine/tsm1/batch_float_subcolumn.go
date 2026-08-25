@@ -43,86 +43,87 @@ func floatArrayEncodeAllSubcolumn(src []float64, b []byte) ([]byte, error) {
 			for i, value := range blockResiduals {
 				blockDigits[i] = byte(value>>shift) & 0xf
 			}
-			mode, payload := encodeFloatSubcolumnGroup(blockDigits)
-			out = append(out, mode)
-			out = appendFloatExperimentalU32(out, uint32(len(payload)))
-			out = append(out, payload...)
+			out = appendFloatSubcolumnGroup(out, blockDigits)
 		}
 	}
 	return out, nil
 }
 
-func encodeFloatSubcolumnGroup(values []byte) (byte, []byte) {
-	packed := packFloatSubcolumnNibbles(values)
-	rle := encodeFloatSubcolumnRLE(values)
-	dictionary := encodeFloatSubcolumnDictionary(values)
-	if len(rle) < len(packed) && len(rle) <= len(dictionary) {
-		return 1, rle
-	}
-	if len(dictionary) < len(packed) {
-		return 2, dictionary
-	}
-	return 0, packed
-}
-
-func packFloatSubcolumnNibbles(values []byte) []byte {
-	out := make([]byte, (len(values)+1)/2)
-	for i, value := range values {
-		out[i/2] |= (value & 0xf) << ((i & 1) * 4)
-	}
-	return out
-}
-
-func encodeFloatSubcolumnRLE(values []byte) []byte {
-	out := make([]byte, 0, len(values)/2)
+func appendFloatSubcolumnGroup(out []byte, values []byte) []byte {
+	packedLength := (len(values) + 1) / 2
+	runs := 0
 	for start := 0; start < len(values); {
 		end := start + 1
 		for end < len(values) && values[end] == values[start] {
 			end++
 		}
-		out = append(out, values[start])
-		out = appendFloatExperimentalU32(out, uint32(end-start))
+		runs++
 		start = end
 	}
-	return out
-}
+	rleLength := runs * 5
 
-func encodeFloatSubcolumnDictionary(values []byte) []byte {
-	dictionary := make([]byte, 0, 16)
-	indexes := make([]uint64, len(values))
-	for i, value := range values {
-		index := -1
-		for j, entry := range dictionary {
-			if entry == value {
-				index = j
-				break
-			}
-		}
-		if index < 0 {
-			dictionary = append(dictionary, value)
-			index = len(dictionary) - 1
-		}
-		indexes[i] = uint64(index)
-	}
-	width := floatExperimentalBitWidth(uint64(len(dictionary) - 1))
-	packed := packFloatSubcolumnBitsLSB(indexes, width)
-	out := make([]byte, 0, len(dictionary)+len(packed)+2)
-	out = append(out, byte(len(dictionary)))
-	out = append(out, dictionary...)
-	out = append(out, width)
-	out = append(out, packed...)
-	return out
-}
-
-func packFloatSubcolumnBitsLSB(values []uint64, width uint8) []byte {
-	out := make([]byte, floatExperimentalPackedByteLen(len(values), width))
-	bitPosition := 0
+	indexes := [16]int8{-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1}
+	var dictionary [16]byte
+	dictionaryLength := 0
 	for _, value := range values {
-		for bit := uint8(0); bit < width; bit++ {
-			if value&(uint64(1)<<bit) != 0 {
-				out[bitPosition/8] |= 1 << (bitPosition & 7)
+		if indexes[value] < 0 {
+			indexes[value] = int8(dictionaryLength)
+			dictionary[dictionaryLength] = value
+			dictionaryLength++
+		}
+	}
+	width := floatExperimentalBitWidth(uint64(dictionaryLength - 1))
+	dictionaryLengthBytes := 1 + dictionaryLength + 1 + floatExperimentalPackedByteLen(len(values), width)
+
+	mode := byte(0)
+	payloadLength := packedLength
+	if rleLength < packedLength && rleLength <= dictionaryLengthBytes {
+		mode = 1
+		payloadLength = rleLength
+	} else if dictionaryLengthBytes < packedLength {
+		mode = 2
+		payloadLength = dictionaryLengthBytes
+	}
+	out = append(out, mode)
+	out = appendFloatExperimentalU32(out, uint32(payloadLength))
+
+	switch mode {
+	case 0:
+		payloadStart := len(out)
+		out = append(out, make([]byte, packedLength)...)
+		for i, value := range values {
+			out[payloadStart+i/2] |= (value & 0xf) << ((i & 1) * 4)
+		}
+	case 1:
+		for start := 0; start < len(values); {
+			end := start + 1
+			for end < len(values) && values[end] == values[start] {
+				end++
 			}
-			bitPosition++
+			out = append(out, values[start])
+			out = appendFloatExperimentalU32(out, uint32(end-start))
+			start = end
+		}
+	case 2:
+		out = append(out, byte(dictionaryLength))
+		out = append(out, dictionary[:dictionaryLength]...)
+		out = append(out, width)
+		packedLength := floatExperimentalPackedByteLen(len(values), width)
+		payloadStart := len(out)
+		out = append(out, make([]byte, packedLength)...)
+		if width == 0 {
+			break
+		}
+		bitPosition := 0
+		for _, value := range values {
+			index := byte(indexes[value])
+			bytePosition := bitPosition >> 3
+			bitOffset := bitPosition & 7
+			out[payloadStart+bytePosition] |= index << bitOffset
+			if bitOffset+int(width) > 8 {
+				out[payloadStart+bytePosition+1] |= index >> (8 - bitOffset)
+			}
+			bitPosition += int(width)
 		}
 	}
 	return out
@@ -183,13 +184,8 @@ func floatArrayDecodeAllSubcolumn(b []byte, dst []float64) ([]float64, error) {
 			if groupErr != nil {
 				return nil, groupErr
 			}
-			digits, groupErr := decodeFloatSubcolumnGroup(mode, payload, length)
-			if groupErr != nil {
+			if groupErr = decodeFloatSubcolumnGroupInto(mode, payload, blockResiduals, group*4); groupErr != nil {
 				return nil, groupErr
-			}
-			shift := group * 4
-			for i, digit := range digits {
-				blockResiduals[i] |= uint64(digit) << shift
 			}
 		}
 		for _, residual := range blockResiduals {
@@ -203,100 +199,95 @@ func floatArrayDecodeAllSubcolumn(b []byte, dst []float64) ([]float64, error) {
 	return dst, nil
 }
 
-func decodeFloatSubcolumnGroup(mode byte, payload []byte, length int) ([]byte, error) {
+func decodeFloatSubcolumnGroupInto(mode byte, payload []byte, residuals []uint64, shift int) error {
 	switch mode {
 	case 0:
-		if len(payload) != (length+1)/2 {
-			return nil, fmt.Errorf("Sub-column packed digit length is invalid")
+		if len(payload) != (len(residuals)+1)/2 {
+			return fmt.Errorf("Sub-column packed digit length is invalid")
 		}
-		values := make([]byte, length)
-		for i := range values {
-			values[i] = (payload[i/2] >> ((i & 1) * 4)) & 0xf
+		for i := range residuals {
+			digit := (payload[i/2] >> ((i & 1) * 4)) & 0xf
+			residuals[i] |= uint64(digit) << shift
 		}
-		return values, nil
+		return nil
 	case 1:
-		return decodeFloatSubcolumnRLE(payload, length)
+		return decodeFloatSubcolumnRLEInto(payload, residuals, shift)
 	case 2:
-		return decodeFloatSubcolumnDictionary(payload, length)
+		return decodeFloatSubcolumnDictionaryInto(payload, residuals, shift)
 	default:
-		return nil, fmt.Errorf("Sub-column group mode is invalid")
+		return fmt.Errorf("Sub-column group mode is invalid")
 	}
 }
 
-func decodeFloatSubcolumnRLE(payload []byte, length int) ([]byte, error) {
+func decodeFloatSubcolumnRLEInto(payload []byte, residuals []uint64, shift int) error {
 	reader := floatExperimentalReader{data: payload}
-	values := make([]byte, 0, length)
-	for len(values) < length {
+	position := 0
+	for position < len(residuals) {
 		value, err := reader.readU8()
 		if err != nil || value > 0xf {
-			return nil, fmt.Errorf("Sub-column RLE digit is invalid")
+			return fmt.Errorf("Sub-column RLE digit is invalid")
 		}
 		run32, err := reader.readU32()
 		run := int(run32)
-		if err != nil || run == 0 || run > length-len(values) {
-			return nil, fmt.Errorf("Sub-column RLE run is invalid")
+		if err != nil || run == 0 || run > len(residuals)-position {
+			return fmt.Errorf("Sub-column RLE run is invalid")
 		}
-		for range run {
-			values = append(values, value)
+		for end := position + run; position < end; position++ {
+			residuals[position] |= uint64(value) << shift
 		}
 	}
 	if reader.position != len(payload) {
-		return nil, fmt.Errorf("Sub-column RLE group has trailing bytes")
+		return fmt.Errorf("Sub-column RLE group has trailing bytes")
 	}
-	return values, nil
+	return nil
 }
 
-func decodeFloatSubcolumnDictionary(payload []byte, length int) ([]byte, error) {
+func decodeFloatSubcolumnDictionaryInto(payload []byte, residuals []uint64, shift int) error {
 	reader := floatExperimentalReader{data: payload}
 	dictionaryLengthByte, err := reader.readU8()
 	dictionaryLength := int(dictionaryLengthByte)
 	if err != nil || dictionaryLength < 1 || dictionaryLength > 16 {
-		return nil, fmt.Errorf("Sub-column dictionary length is invalid")
+		return fmt.Errorf("Sub-column dictionary length is invalid")
 	}
 	dictionary, err := reader.readBytes(dictionaryLength)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	for _, value := range dictionary {
 		if value > 0xf {
-			return nil, fmt.Errorf("Sub-column dictionary digit is invalid")
+			return fmt.Errorf("Sub-column dictionary digit is invalid")
 		}
 	}
 	width, err := reader.readU8()
-	if err != nil || width > 4 || len(payload)-reader.position != floatExperimentalPackedByteLen(length, width) {
-		return nil, fmt.Errorf("Sub-column dictionary width is invalid")
+	if err != nil || width > 4 || len(payload)-reader.position != floatExperimentalPackedByteLen(len(residuals), width) {
+		return fmt.Errorf("Sub-column dictionary width is invalid")
 	}
 	packed, err := reader.readBytes(len(payload) - reader.position)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	indexes, err := unpackFloatSubcolumnBitsLSB(packed, length, width)
-	if err != nil {
-		return nil, err
-	}
-	values := make([]byte, length)
-	for i, index := range indexes {
-		if index >= uint64(len(dictionary)) {
-			return nil, fmt.Errorf("Sub-column dictionary index is invalid")
+	if width == 0 {
+		value := uint64(dictionary[0]) << shift
+		for i := range residuals {
+			residuals[i] |= value
 		}
-		values[i] = dictionary[index]
+		return nil
 	}
-	return values, nil
-}
-
-func unpackFloatSubcolumnBitsLSB(payload []byte, count int, width uint8) ([]uint64, error) {
-	if len(payload) != floatExperimentalPackedByteLen(count, width) {
-		return nil, fmt.Errorf("Sub-column bit-packed length is invalid")
-	}
-	values := make([]uint64, count)
+	mask := uint16((1 << width) - 1)
 	bitPosition := 0
-	for i := range values {
-		for bit := uint8(0); bit < width; bit++ {
-			if payload[bitPosition/8]&(1<<(bitPosition&7)) != 0 {
-				values[i] |= uint64(1) << bit
-			}
-			bitPosition++
+	for i := range residuals {
+		bytePosition := bitPosition >> 3
+		bitOffset := bitPosition & 7
+		word := uint16(packed[bytePosition])
+		if bitOffset+int(width) > 8 {
+			word |= uint16(packed[bytePosition+1]) << 8
 		}
+		index := int((word >> bitOffset) & mask)
+		if index >= len(dictionary) {
+			return fmt.Errorf("Sub-column dictionary index is invalid")
+		}
+		residuals[i] |= uint64(dictionary[index]) << shift
+		bitPosition += int(width)
 	}
-	return values, nil
+	return nil
 }
