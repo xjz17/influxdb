@@ -215,8 +215,14 @@ func selectFloatBOSOrderStats(values []int64, base, total int, stats []floatBOSO
 	}
 	firstEqual := base + less
 	afterEqual := base + greater
-	leftEnd := sort.Search(len(stats), func(i int) bool { return stats[i].rank >= firstEqual })
-	rightStart := sort.Search(len(stats), func(i int) bool { return stats[i].rank >= afterEqual })
+	leftEnd := 0
+	for leftEnd < len(stats) && stats[leftEnd].rank < firstEqual {
+		leftEnd++
+	}
+	rightStart := leftEnd
+	for rightStart < len(stats) && stats[rightStart].rank < afterEqual {
+		rightStart++
+	}
 	for i := leftEnd; i < rightStart; i++ {
 		stats[i].value = pivot
 		stats[i].below = firstEqual
@@ -367,7 +373,32 @@ func floatExperimentalWriteBitsMSB(data []byte, bitPosition *int, value uint64, 
 	if remaining == 0 {
 		return
 	}
-	bitOffset := *bitPosition & 7
+	start := *bitPosition
+	bytePosition := start >> 3
+	bitOffset := start & 7
+	if len(data)-bytePosition >= 8 {
+		word := uint64(data[bytePosition]) << 56
+		available := 64 - bitOffset
+		masked := value
+		if remaining < 64 {
+			masked &= (uint64(1) << remaining) - 1
+		}
+		if remaining <= available {
+			word |= masked << (available - remaining)
+			binary.BigEndian.PutUint64(data[bytePosition:], word)
+			*bitPosition = start + remaining
+			return
+		}
+		if len(data)-bytePosition >= 9 {
+			tail := remaining - available
+			word |= masked >> tail
+			binary.BigEndian.PutUint64(data[bytePosition:], word)
+			data[bytePosition+8] |= byte(masked) << (8 - tail)
+			*bitPosition = start + remaining
+			return
+		}
+	}
+	bitOffset = *bitPosition & 7
 	if bitOffset != 0 {
 		take := min(8-bitOffset, remaining)
 		shift := remaining - take
@@ -404,8 +435,29 @@ func floatExperimentalReadBitsMSBUnchecked(data []byte, bitPosition *int, width 
 	if remaining == 0 {
 		return 0
 	}
+	start := *bitPosition
+	bytePosition := start >> 3
+	bitOffset := start & 7
+	if len(data)-bytePosition >= 8 {
+		word := binary.BigEndian.Uint64(data[bytePosition:])
+		available := 64 - bitOffset
+		if remaining <= available {
+			*bitPosition = start + remaining
+			if remaining == 64 {
+				return word
+			}
+			return word >> (available - remaining) & ((uint64(1) << remaining) - 1)
+		}
+		if len(data)-bytePosition >= 9 {
+			tail := remaining - available
+			value := word & ((uint64(1) << available) - 1)
+			value = value<<tail | uint64(data[bytePosition+8]>>(8-tail))
+			*bitPosition = start + remaining
+			return value
+		}
+	}
 	var value uint64
-	bitOffset := *bitPosition & 7
+	bitOffset = *bitPosition & 7
 	if bitOffset != 0 {
 		take := min(8-bitOffset, remaining)
 		shift := 8 - bitOffset - take

@@ -1,6 +1,7 @@
 package tsm1
 
 import (
+	"encoding/binary"
 	"fmt"
 	"math"
 )
@@ -108,6 +109,17 @@ func appendFloatSubcolumnGroup(out []byte, residuals []uint64, shift int) []byte
 		payloadStart := len(out)
 		out = append(out, make([]byte, packedLength)...)
 		i := 0
+		for ; i+8 <= len(residuals); i += 8 {
+			word := uint32(byte(residuals[i]>>shift)&0xf) |
+				uint32(byte(residuals[i+1]>>shift)&0xf)<<4 |
+				uint32(byte(residuals[i+2]>>shift)&0xf)<<8 |
+				uint32(byte(residuals[i+3]>>shift)&0xf)<<12 |
+				uint32(byte(residuals[i+4]>>shift)&0xf)<<16 |
+				uint32(byte(residuals[i+5]>>shift)&0xf)<<20 |
+				uint32(byte(residuals[i+6]>>shift)&0xf)<<24 |
+				uint32(byte(residuals[i+7]>>shift)&0xf)<<28
+			binary.LittleEndian.PutUint32(out[payloadStart+i/2:], word)
+		}
 		for ; i+1 < len(residuals); i += 2 {
 			low := byte(residuals[i]>>shift) & 0xf
 			high := byte(residuals[i+1]>>shift) & 0xf
@@ -138,7 +150,24 @@ func appendFloatSubcolumnGroup(out []byte, residuals []uint64, shift int) []byte
 			break
 		}
 		payloadPosition := payloadStart
-		for start := 0; start < len(residuals); start += 8 {
+		start := 0
+		if width == 3 {
+			for ; start+8 <= len(residuals); start += 8 {
+				word := uint32(byte(indexes[byte(residuals[start]>>shift)&0xf])) |
+					uint32(byte(indexes[byte(residuals[start+1]>>shift)&0xf]))<<3 |
+					uint32(byte(indexes[byte(residuals[start+2]>>shift)&0xf]))<<6 |
+					uint32(byte(indexes[byte(residuals[start+3]>>shift)&0xf]))<<9 |
+					uint32(byte(indexes[byte(residuals[start+4]>>shift)&0xf]))<<12 |
+					uint32(byte(indexes[byte(residuals[start+5]>>shift)&0xf]))<<15 |
+					uint32(byte(indexes[byte(residuals[start+6]>>shift)&0xf]))<<18 |
+					uint32(byte(indexes[byte(residuals[start+7]>>shift)&0xf]))<<21
+				out[payloadPosition] = byte(word)
+				out[payloadPosition+1] = byte(word >> 8)
+				out[payloadPosition+2] = byte(word >> 16)
+				payloadPosition += 3
+			}
+		}
+		for ; start < len(residuals); start += 8 {
 			count := min(8, len(residuals)-start)
 			var word uint32
 			for offset := 0; offset < count; offset++ {
@@ -240,7 +269,20 @@ func decodeFloatSubcolumnGroupInto(mode byte, payload []byte, residuals []uint64
 			return fmt.Errorf("Sub-column packed digit length is invalid")
 		}
 		position := 0
-		for _, value := range payload {
+		payloadPosition := 0
+		for ; position+8 <= len(residuals); position += 8 {
+			word := binary.LittleEndian.Uint32(payload[payloadPosition:])
+			residuals[position] |= uint64(word&0xf) << shift
+			residuals[position+1] |= uint64(word>>4&0xf) << shift
+			residuals[position+2] |= uint64(word>>8&0xf) << shift
+			residuals[position+3] |= uint64(word>>12&0xf) << shift
+			residuals[position+4] |= uint64(word>>16&0xf) << shift
+			residuals[position+5] |= uint64(word>>20&0xf) << shift
+			residuals[position+6] |= uint64(word>>24&0xf) << shift
+			residuals[position+7] |= uint64(word>>28) << shift
+			payloadPosition += 4
+		}
+		for _, value := range payload[payloadPosition:] {
 			residuals[position] |= uint64(value&0xf) << shift
 			position++
 			if position < len(residuals) {
@@ -314,7 +356,37 @@ func decodeFloatSubcolumnDictionaryInto(payload []byte, residuals []uint64, shif
 	}
 	mask := uint32((1 << width) - 1)
 	payloadPosition := 0
-	for start := 0; start < len(residuals); start += 8 {
+	start := 0
+	if width == 3 {
+		dictionarySize := uint32(len(dictionary))
+		for ; start+8 <= len(residuals); start += 8 {
+			word := uint32(packed[payloadPosition]) |
+				uint32(packed[payloadPosition+1])<<8 |
+				uint32(packed[payloadPosition+2])<<16
+			index0 := word & 7
+			index1 := word >> 3 & 7
+			index2 := word >> 6 & 7
+			index3 := word >> 9 & 7
+			index4 := word >> 12 & 7
+			index5 := word >> 15 & 7
+			index6 := word >> 18 & 7
+			index7 := word >> 21
+			if index0 >= dictionarySize || index1 >= dictionarySize || index2 >= dictionarySize || index3 >= dictionarySize ||
+				index4 >= dictionarySize || index5 >= dictionarySize || index6 >= dictionarySize || index7 >= dictionarySize {
+				return fmt.Errorf("Sub-column dictionary index is invalid")
+			}
+			residuals[start] |= uint64(dictionary[index0]) << shift
+			residuals[start+1] |= uint64(dictionary[index1]) << shift
+			residuals[start+2] |= uint64(dictionary[index2]) << shift
+			residuals[start+3] |= uint64(dictionary[index3]) << shift
+			residuals[start+4] |= uint64(dictionary[index4]) << shift
+			residuals[start+5] |= uint64(dictionary[index5]) << shift
+			residuals[start+6] |= uint64(dictionary[index6]) << shift
+			residuals[start+7] |= uint64(dictionary[index7]) << shift
+			payloadPosition += 3
+		}
+	}
+	for ; start < len(residuals); start += 8 {
 		count := min(8, len(residuals)-start)
 		bytes := (count*int(width) + 7) / 8
 		var word uint32
