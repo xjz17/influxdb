@@ -140,7 +140,10 @@ func (s *FloatEncoder) Write(v float64) {
 
 // FloatDecoder decodes a byte slice into multiple float64 values.
 type FloatDecoder struct {
-	val uint64
+	val           uint64
+	batch         []float64
+	batchIndex    int
+	batchEncoding bool
 
 	leading  uint64
 	trailing uint64
@@ -156,6 +159,22 @@ type FloatDecoder struct {
 
 // SetBytes initializes the decoder with b. Must call before calling Next().
 func (it *FloatDecoder) SetBytes(b []byte) error {
+	it.batchIndex = -1
+	it.batchEncoding = len(b) > 0 && (b[0]>>4 == floatCompressedBOS || b[0]>>4 == floatCompressedSubcolumn)
+	if it.batchEncoding {
+		decoded, err := FloatArrayDecodeAll(b, it.batch[:0])
+		if err != nil {
+			it.err = err
+			return err
+		}
+		it.batch = decoded
+		it.first = false
+		it.finished = false
+		it.err = nil
+		it.b = b
+		return nil
+	}
+	it.batch = it.batch[:0]
 	var v uint64
 	if len(b) == 0 {
 		v = uvnan
@@ -185,6 +204,13 @@ func (it *FloatDecoder) SetBytes(b []byte) error {
 
 // Next returns true if there are remaining values to read.
 func (it *FloatDecoder) Next() bool {
+	if it.batchEncoding {
+		if it.err != nil || it.batchIndex+1 >= len(it.batch) {
+			return false
+		}
+		it.batchIndex++
+		return true
+	}
 	if it.err != nil || it.finished {
 		return false
 	}
@@ -271,6 +297,9 @@ func (it *FloatDecoder) Next() bool {
 
 // Values returns the current float64 value.
 func (it *FloatDecoder) Values() float64 {
+	if it.batchEncoding {
+		return it.batch[it.batchIndex]
+	}
 	return math.Float64frombits(it.val)
 }
 

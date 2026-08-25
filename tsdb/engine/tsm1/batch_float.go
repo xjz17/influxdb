@@ -15,6 +15,10 @@ import (
 // Currently only the float compression scheme used in Facebook's Gorilla is
 // supported, so this method implements a batch oriented version of that.
 func FloatArrayEncodeAll(src []float64, b []byte) ([]byte, error) {
+	return FloatArrayEncodeAllWithEncoding(src, b, FloatArrayEncodingGorilla)
+}
+
+func floatArrayEncodeAllGorilla(src []float64, b []byte) ([]byte, error) {
 	if cap(b) < 9 {
 		b = make([]byte, 0, 9) // Enough room for the header and one value.
 	}
@@ -276,6 +280,23 @@ func init() {
 }
 
 func FloatArrayDecodeAll(b []byte, buf []float64) ([]float64, error) {
+	if len(b) == 0 {
+		return []float64{}, nil
+	}
+
+	switch b[0] >> 4 {
+	case floatCompressedGorilla:
+		return floatArrayDecodeAllGorilla(b, buf)
+	case floatCompressedBOS:
+		return floatArrayDecodeAllBOS(b, buf)
+	case floatCompressedSubcolumn:
+		return floatArrayDecodeAllSubcolumn(b, buf)
+	default:
+		return []float64{}, fmt.Errorf("FloatArrayDecodeAll: unknown encoding %d", b[0]>>4)
+	}
+}
+
+func floatArrayDecodeAllGorilla(b []byte, buf []float64) ([]float64, error) {
 	if len(b) < 9 {
 		return []float64{}, nil
 	}
