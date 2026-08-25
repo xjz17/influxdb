@@ -318,6 +318,9 @@ func floatArrayDecodeAllBOS(b []byte, dst []float64) ([]float64, error) {
 		if readErr != nil {
 			return nil, readErr
 		}
+		if remainder := deltaCount & 7; remainder != 0 && bitmap[len(bitmap)-1]&^byte((1<<remainder)-1) != 0 {
+			return nil, fmt.Errorf("BOS float block has an invalid outlier bitmap")
+		}
 		actualOutliers := 0
 		for _, value := range bitmap {
 			actualOutliers += bits.OnesCount8(value)

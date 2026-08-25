@@ -134,6 +134,23 @@ func TestFloatArrayBOSRejectsOversizedHeader(t *testing.T) {
 	}
 }
 
+func TestFloatArrayBOSRejectsBitmapPaddingBits(t *testing.T) {
+	payload := []byte{byte(floatCompressedBOS << 4)}
+	payload = appendFloatExperimentalU32(payload, 2)
+	payload = appendFloatExperimentalU32(payload, floatExperimentalBlockSize)
+	payload = appendFloatExperimentalU32(payload, 2)
+	payload = appendFloatExperimentalI64(payload, 0)
+	payload = appendFloatExperimentalI64(payload, 0)
+	payload = append(payload, 1)
+	payload = appendFloatExperimentalU32(payload, 1)
+	payload = appendFloatExperimentalU32(payload, 0)
+	payload = appendFloatExperimentalU32(payload, 1)
+	payload = append(payload, 0x02)
+	if _, err := floatArrayDecodeAllBOS(payload, nil); err == nil || err.Error() != "BOS float block has an invalid outlier bitmap" {
+		t.Fatalf("bitmap padding error: got %v", err)
+	}
+}
+
 func BenchmarkFloatArrayBOSOptimization(b *testing.B) {
 	values := make([]float64, 128*1024)
 	for i := range values {
